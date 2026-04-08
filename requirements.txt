@@ -1,0 +1,9 @@
+streamlit
+ultralytics
+pillow
+numpy
+pandas
+matplotlib
+torch
+scikit-image
+joblib
