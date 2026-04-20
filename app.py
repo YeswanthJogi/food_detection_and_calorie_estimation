@@ -5,10 +5,13 @@ import pandas as pd
 import tempfile
 import os
 import matplotlib.pyplot as plt
+import joblib
+
 from ultralytics import YOLO
+from skimage.measure import label, regionprops
 
 # -----------------------------
-# Page Config
+# PAGE CONFIG
 # -----------------------------
 st.set_page_config(
     page_title="Food Detection and Calorie Estimation",
@@ -16,244 +19,194 @@ st.set_page_config(
     layout="wide"
 )
 
-# -----------------------------
-# Custom Styling (YOUR ORIGINAL)
-# -----------------------------
-st.markdown("""
-<style>
-.title {
-font-size:42px;
-font-weight:800;
-text-align:center;
-background: linear-gradient(90deg,#ff416c,#ff4b2b,#ffb347);
--webkit-background-clip:text;
--webkit-text-fill-color:transparent;
-margin-bottom:5px;
-}
-.subtitle {
-text-align:center;
-font-size:18px;
-color:#8aa0b4;
-margin-bottom:5px;
-}
-.banner {
-background:linear-gradient(135deg,#1f4037,#99f2c8);
-padding:12px;
-border-radius:12px;
-text-align:center;
-font-size:16px;
-font-weight:600;
-color:black;
-margin-top:10px;
-margin-bottom:20px;
-}
-.card{
-background:linear-gradient(135deg,#667eea,#764ba2);
-padding:8px;
-border-radius:10px;
-text-align:center;
-color:white;
-margin-bottom:8px;
-font-size:14px;
-}
-.sidebar-title{
-font-size:22px;
-font-weight:700;
-text-align:center;
-margin-bottom:10px;
-color:#ff7a18;
-}
-.sidebar-box{
-background:linear-gradient(135deg,#1c1c1c,#2c3e50);
-padding:10px;
-border-radius:10px;
-margin-bottom:10px;
-color:white;
-text-align:center;
-}
-.support-text{
-font-size:13px;
-color:#9ca3af;
-margin-top:-8px;
-text-align:center;
-}
-</style>
-""", unsafe_allow_html=True)
+st.title("🍽️ Food Detection & Calorie Estimation (AI + ML)")
 
 # -----------------------------
-# Header
-# -----------------------------
-st.markdown('<div class="title">🍽️ FOOD DETECTION AND CALORIE ESTIMATION</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Upload a food image and detect items using your trained YOLO model</div>', unsafe_allow_html=True)
-
-# -----------------------------
-# Sidebar
-# -----------------------------
-st.sidebar.markdown('<div class="sidebar-title">⚙ Detection Settings</div>', unsafe_allow_html=True)
-st.sidebar.markdown('<div class="sidebar-box">Adjust confidence level for detection</div>', unsafe_allow_html=True)
-
-confidence = st.sidebar.slider("Confidence Threshold", 0.0, 1.0, 0.25, 0.01)
-
-st.sidebar.markdown("### 📷 Upload Food Image")
-
-uploaded_file = st.sidebar.file_uploader("Upload", type=["jpg","jpeg","png"])
-
-st.sidebar.markdown(
-    '<div class="support-text">Supported formats: JPG • JPEG • PNG</div>',
-    unsafe_allow_html=True
-)
-
-# -----------------------------
-# Banner
-# -----------------------------
-if uploaded_file is None:
-    st.markdown('<div class="banner">📷 Upload a food image using the sidebar to start food detection</div>', unsafe_allow_html=True)
-
-# -----------------------------
-# Calories
-# -----------------------------
-calorie_dict = {
-    "apple":95,
-    "banana":105,
-    "orange":62,
-    "pizza":285,
-    "burger":354
-}
-
-# -----------------------------
-# Load Model
+# LOAD FILES
 # -----------------------------
 @st.cache_resource
-def load_model():
-    return YOLO("best_new.pt")
+def load_all():
+    model = YOLO("best_new.pt")
+
+    calib_df = pd.read_csv("calibration.csv")
+
+    nutrition_df = pd.read_csv("nutrition.csv")
+    nutrition_df["food"] = nutrition_df["food"].str.lower().str.strip()
+    calorie_dict = dict(zip(nutrition_df["food"], nutrition_df["kcal_per_100g"]))
+
+    count_df = pd.read_csv("count_based_config.csv")
+    count_df["food"] = count_df["food"].str.lower().str.strip()
+    count_weight_dict = dict(zip(count_df["food"], count_df["weight_per_item"]))
+
+    return model, calib_df, calorie_dict, count_weight_dict
+
+model, calib_df, calorie_dict, count_weight_dict = load_all()
 
 # -----------------------------
-# Main Logic
+# FILE UPLOAD
 # -----------------------------
-if uploaded_file is not None:
+uploaded_file = st.file_uploader("Upload Food Image", type=["jpg","jpeg","png"])
 
-    st.subheader("🔍 Food Detection Results")
+if uploaded_file:
 
     image = Image.open(uploaded_file).convert("RGB")
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("📷 Uploaded Image")
-        st.image(image, use_container_width=True)
+        st.image(image, caption="Uploaded Image", use_container_width=True)
 
+    # SAVE TEMP FILE
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp:
         image.save(temp.name)
         temp_path = temp.name
 
-    with st.spinner("⏳ Loading model..."):
-        model = load_model()
-
-    results = model(temp_path, conf=confidence)
+    # -----------------------------
+    # YOLO DETECTION
+    # -----------------------------
+    results = model(temp_path, conf=0.25)
 
     annotated = results[0].plot()
 
     with col2:
-        st.subheader("🎯 Detection Output")
         st.image(annotated, channels="BGR", use_container_width=True)
 
-    detections = []
-    names = model.names
+    # -----------------------------
+    # MAIN LOGIC (FROM test_model.py)
+    # -----------------------------
+    total_calories = 0
+    rows = []
+    count_items = {}
+    count = 1
 
     for r in results:
-        if r.boxes is None:
+        if r.masks is None:
             continue
 
-        cls_ids = r.boxes.cls.cpu().numpy().astype(int)
-        confs = r.boxes.conf.cpu().numpy()
+        masks = r.masks.data.cpu().numpy()
+        classes = r.boxes.cls.cpu().numpy()
 
-        for c, conf_score in zip(cls_ids, confs):
-            detections.append({
-                "Food Item": names[c],
-                "Confidence": round(float(conf_score), 3)
-            })
+        for i in range(len(masks)):
 
-    if len(detections) > 0:
+            mask = (masks[i] > 0.5).astype(np.uint8)
 
-        df = pd.DataFrame(detections)
+            y_idx, x_idx = np.where(mask)
+            if len(x_idx) == 0:
+                continue
 
-        st.subheader("🍎 Detected Food Items")
+            x_min, x_max = x_idx.min(), x_idx.max()
+            y_min, y_max = y_idx.min(), y_idx.max()
+            mask = mask[y_min:y_max+1, x_min:x_max+1]
 
-        counts = df["Food Item"].value_counts()
+            mask_area = np.sum(mask)
+            height, width = mask.shape
+            bbox_area = width * height
 
-        # ✅ FIXED: smaller + aligned grid
-        cols = st.columns(3)
-        i = 0
+            labeled = label(mask)
+            regions = regionprops(labeled)
+            if len(regions) == 0:
+                continue
 
-        for food, count in counts.items():
-            avg_conf = df[df["Food Item"] == food]["Confidence"].mean() * 100
+            region = max(regions, key=lambda r: r.area)
 
-            with cols[i % 3]:
-                st.markdown(f"""
-                <div class="card">
-                <b>{food.capitalize()}</b><br>
-                {count} item(s)<br>
-                {avg_conf:.1f}% confidence
-                </div>
-                """, unsafe_allow_html=True)
-            i += 1
+            perimeter = region.perimeter
+            convex_area = region.area_convex
+            major_axis = region.axis_major_length
+            minor_axis = region.axis_minor_length
 
-        # Nutrition Table
-        st.subheader("📊 Nutrition Table")
+            food = model.names[int(classes[i])].lower().strip()
 
-        nutrition = []
-        total_calories = 0
+            # -----------------------------
+            # COUNT-BASED ITEMS
+            # -----------------------------
+            if food in count_weight_dict:
+                count_items[food] = count_items.get(food, 0) + 1
+                continue
 
-        for food, count in counts.items():
-            calories = calorie_dict.get(food, 50)
-            total = calories * count
-            total_calories += total
+            # -----------------------------
+            # FEATURE EXTRACTION
+            # -----------------------------
+            area_ratio = mask_area / (bbox_area + 1e-6)
+            aspect_ratio = width / (height + 1e-6)
+            solidity = mask_area / (convex_area + 1e-6)
+            eccentricity = region.eccentricity
 
-            nutrition.append({
-                "Food Item": food,
-                "Count": count,
-                "Calories": total
-            })
+            equiv_diameter = np.sqrt(4 * mask_area / np.pi)
+            thickness = mask_area / (bbox_area + 1e-6)
+            volume_proxy = (equiv_diameter ** 2) * thickness
 
-        nutrition_df = pd.DataFrame(nutrition)
-        st.dataframe(nutrition_df, use_container_width=True)
+            roundness = (4 * np.pi * mask_area) / (perimeter**2 + 1e-6)
+            compactness = (perimeter**2) / (mask_area + 1e-6)
 
-        st.markdown(
-        f"<h2 style='color:#ff4b2b'>🔥 Total Estimated Calories: {total_calories} kcal</h2>",
-        unsafe_allow_html=True
-        )
+            elongation = major_axis / (minor_axis + 1e-6)
+            fill_ratio = mask_area / (convex_area + 1e-6)
 
-        # -----------------------------
-        # 🔥 UPDATED UNIQUE DONUT CHART
-        # -----------------------------
-        st.subheader("🥧 Calorie Distribution")
+            features = pd.DataFrame([{
+                "area_ratio": area_ratio,
+                "aspect_ratio": aspect_ratio,
+                "solidity": solidity,
+                "eccentricity": eccentricity,
+                "equiv_diameter": equiv_diameter,
+                "thickness": thickness,
+                "volume_proxy": volume_proxy,
+                "roundness": roundness,
+                "compactness": compactness,
+                "elongation": elongation,
+                "fill_ratio": fill_ratio
+            }])
 
-        fig, ax = plt.subplots()
+            # -----------------------------
+            # LOAD MODELS
+            # -----------------------------
+            try:
+                xgb = joblib.load(f"models/xgb_{food}.pkl")
+                rf = joblib.load(f"models/rf_{food}.pkl")
+                cols = joblib.load(f"models/cols_{food}.pkl")
+            except:
+                continue
 
-        colors = plt.cm.Set3.colors
+            features = features[cols]
 
-        wedges, texts, autotexts = ax.pie(
-            nutrition_df["Calories"],
-            labels=nutrition_df["Food Item"],
-            autopct="%1.1f%%",
-            startangle=140,
-            colors=colors,
-            wedgeprops=dict(width=0.4)
-        )
+            pred_xgb = np.exp(xgb.predict(features)[0]) - 1
+            pred_rf = np.exp(rf.predict(features)[0]) - 1
 
-        # center circle
-        centre_circle = plt.Circle((0,0),0.60,fc='white')
-        fig.gca().add_artist(centre_circle)
+            pred = 0.5 * pred_xgb + 0.5 * pred_rf
 
-        # center text
-        ax.text(0, 0, f"{total_calories}\nkcal",
-                ha='center', va='center', fontsize=12, fontweight='bold')
+            # -----------------------------
+            # CALIBRATION
+            # -----------------------------
+            row = calib_df[calib_df["food"] == food]
+            if len(row) > 0:
+                pred = row["a"].values[0] * pred + row["b"].values[0]
 
-        ax.axis("equal")
+            kcal = (pred / 100) * calorie_dict.get(food, 0)
 
-        st.pyplot(fig)
+            total_calories += kcal
+
+            rows.append((food, pred, kcal))
+
+    # -----------------------------
+    # COUNT ITEMS PROCESSING
+    # -----------------------------
+    for food, cnt in count_items.items():
+        weight_per_item = count_weight_dict[food]
+        total_weight = cnt * weight_per_item
+
+        kcal = (total_weight / 100) * calorie_dict.get(food, 0)
+        total_calories += kcal
+
+        rows.append((f"{food} x {cnt}", total_weight, kcal))
+
+    # -----------------------------
+    # DISPLAY TABLE
+    # -----------------------------
+    if rows:
+        df = pd.DataFrame(rows, columns=["Food", "Weight (g)", "Calories"])
+        st.dataframe(df, use_container_width=True)
+
+        st.success(f"🔥 Total Calories: {total_calories:.2f} kcal")
 
     else:
-        st.warning("No food items detected.")
+        st.warning("No food detected.")
 
     os.remove(temp_path)
